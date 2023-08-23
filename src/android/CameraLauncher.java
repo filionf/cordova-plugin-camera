@@ -18,14 +18,37 @@
 */
 package org.apache.cordova.camera;
 
-import android.Manifest;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.text.SimpleDateFormat;
+import java.util.Base64;
+import java.util.Date;
+import java.util.jar.Manifest;
+
+import javax.naming.NameNotFoundException;
+
+import org.apache.cordova.CallbackContext;
+import org.apache.cordova.CordovaPlugin;
+import org.apache.cordova.LOG;
+import org.apache.cordova.PermissionHelper;
+import org.apache.cordova.PluginResult;
+import org.json.JSONArray;
+import org.json.JSONException;
+
 import android.app.Activity;
+import android.app.PendingIntent;
+import android.app.RecoverableSecurityException;
 import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.IntentSender;
 import android.content.pm.PackageManager;
-import android.content.pm.PackageManager.NameNotFoundException;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Bitmap.CompressFormat;
@@ -40,26 +63,6 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
 import androidx.core.content.FileProvider;
-import android.util.Base64;
-
-import org.apache.cordova.BuildHelper;
-import org.apache.cordova.CallbackContext;
-import org.apache.cordova.CordovaPlugin;
-import org.apache.cordova.LOG;
-import org.apache.cordova.PermissionHelper;
-import org.apache.cordova.PluginResult;
-import org.json.JSONArray;
-import org.json.JSONException;
-
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.text.SimpleDateFormat;
-import java.util.Date;
 
 /**
  * This class launches the camera view, allows the user to take a picture, closes the camera view,
@@ -78,6 +81,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
     private static final int PICTURE = 0;               // allow selection of still pictures only. DEFAULT. Will return format specified via DestinationType
     private static final int VIDEO = 1;                 // allow selection of video only, ONLY RETURNS URL
     private static final int ALLMEDIA = 2;              // allow selection from all media types
+    private static final int RECOVERABLE_DELETE_REQUEST = 3;  // Result of Recoverable Security Exception
 
     private static final int JPEG = 0;                  // Take a picture of type JPEG
     private static final int PNG = 1;                   // Take a picture of type PNG
@@ -122,8 +126,6 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
     private boolean orientationCorrected;   // Has the picture's orientation been corrected
     private boolean allowEdit;              // Should we allow the user to crop the image.
 
-    protected final static String[] permissions = { Manifest.permission.CAMERA, Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE };
-
     public CallbackContext callbackContext;
     private int numPics;
 
@@ -133,7 +135,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
     private String croppedFilePath;
     private ExifHelper exifData;            // Exif data from source
     private String applicationId;
-
+    private Uri pendingDeleteMediaUri;
 
     /**
      * Executes the request and returns PluginResult.
@@ -193,8 +195,9 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
                 }
                 else if ((this.srcType == PHOTOLIBRARY) || (this.srcType == SAVEDPHOTOALBUM)) {
                     // FIXME: Stop always requesting the permission
-                    if(!PermissionHelper.hasPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)) {
-                        PermissionHelper.requestPermission(this, SAVE_TO_ALBUM_SEC, Manifest.permission.READ_EXTERNAL_STORAGE);
+                    String[] permissions = getPermissions(true, mediaType);
+                    if(!hasPermissions(permissions)) {
+                        PermissionHelper.requestPermissions(this, SAVE_TO_ALBUM_SEC, permissions);
                     } else {
                         this.getImage(this.srcType, destType);
                     }
@@ -221,6 +224,37 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
     // LOCAL METHODS
     //--------------------------------------------------------------------------
 
+    private String[] getPermissions(boolean storageOnly, int mediaType) {
+        if (android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (storageOnly) {
+                switch (mediaType) {
+                    case PICTURE:
+                        return new String[]{ Manifest.permission.READ_MEDIA_IMAGES };
+                    case VIDEO:
+                        return new String[]{ Manifest.permission.READ_MEDIA_VIDEO };
+                    default:
+                        return new String[]{ Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO };
+                }
+            }
+            else {
+                switch (mediaType) {
+                    case PICTURE:
+                        return new String[]{ Manifest.permission.CAMERA, Manifest.permission.READ_MEDIA_IMAGES };
+                    case VIDEO:
+                        return new String[]{ Manifest.permission.CAMERA, Manifest.permission.READ_MEDIA_VIDEO };
+                    default:
+                        return new String[]{ Manifest.permission.CAMERA, Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO };
+                }
+            }
+        } else {
+            if (storageOnly) {
+                return new String[]{Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE};
+            } else {
+                return new String[]{Manifest.permission.CAMERA, Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE};
+            }
+        }
+    }
+
     private String getTempDirectoryPath() {
         File cache = cordova.getActivity().getCacheDir();
         // Create the cache directory if it doesn't exist
@@ -243,8 +277,9 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
      * @param encodingType           Compression quality hint (0-100: 0=low quality & high compression, 100=compress of max quality)
      */
     public void callTakePicture(int returnType, int encodingType) {
-        boolean saveAlbumPermission = PermissionHelper.hasPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
-                && PermissionHelper.hasPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE);
+        String[] storagePermissions = getPermissions(true, mediaType);
+        boolean saveAlbumPermission = hasPermissions(storagePermissions);
+
         boolean takePicturePermission = PermissionHelper.hasPermission(this, Manifest.permission.CAMERA);
 
         // CB-10120: The CAMERA permission does not need to be requested unless it is declared
@@ -275,10 +310,9 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
         } else if (saveAlbumPermission) {
             PermissionHelper.requestPermission(this, TAKE_PIC_SEC, Manifest.permission.CAMERA);
         } else if (takePicturePermission) {
-            PermissionHelper.requestPermissions(this, TAKE_PIC_SEC,
-                    new String[]{Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE});
+            PermissionHelper.requestPermissions(this, TAKE_PIC_SEC, storagePermissions);
         } else {
-            PermissionHelper.requestPermissions(this, TAKE_PIC_SEC, permissions);
+            PermissionHelper.requestPermissions(this, TAKE_PIC_SEC, getPermissions(false, mediaType));
         }
     }
 
@@ -717,7 +751,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
             // If you ask for video or the selected file cannot be processed
             // there will be no attempt to resize any returned data.
             if (this.mediaType == VIDEO  || !isImageMimeTypeProcessable(mimeTypeOfGalleryFile)) {
-                this.callbackContext.success(uriString);
+                this.callbackContext.success(finalLocation);
             } else {
 
                 // This is a special case to just return the path as no scaling,
@@ -726,7 +760,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
                         destType == FILE_URI && !this.correctOrientation &&
                         getMimetypeForEncodingType().equalsIgnoreCase(mimeTypeOfGalleryFile))
                 {
-                    this.callbackContext.success(uriString);
+                    this.callbackContext.success(finalLocation);
                 } else {
                     Bitmap bitmap = null;
                     try {
@@ -763,7 +797,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
                                 this.failPicture("Error retrieving image: "+e.getLocalizedMessage());
                             }
                         } else {
-                            this.callbackContext.success(uriString);
+                            this.callbackContext.success(finalLocation);
                         }
                     }
                     if (bitmap != null) {
@@ -871,6 +905,15 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
             } else {
                 this.failPicture("Selection did not complete!");
             }
+        } else if (requestCode == RECOVERABLE_DELETE_REQUEST){
+          // retry media store deletion ...
+          ContentResolver contentResolver = this.cordova.getActivity().getContentResolver();
+          try {
+            contentResolver.delete(this.pendingDeleteMediaUri, null, null);
+          } catch (Exception e) {
+            LOG.e(LOG_TAG, "Unable to delete media store file after permission was granted");
+          }
+          this.pendingDeleteMediaUri = null;
         }
     }
 
@@ -1237,7 +1280,32 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
                 id--;
             }
             Uri uri = Uri.parse(contentStore + "/" + id);
-            this.cordova.getActivity().getContentResolver().delete(uri, null, null);
+            try {
+                this.cordova.getActivity().getContentResolver().delete(uri, null, null);
+            } catch (SecurityException securityException) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    RecoverableSecurityException recoverableSecurityException;
+                    if (securityException instanceof RecoverableSecurityException) {
+                        recoverableSecurityException = (RecoverableSecurityException) securityException;
+                    } else {
+                        throw new RuntimeException(securityException.getMessage(), securityException);
+                    }
+                    PendingIntent pendingIntent = recoverableSecurityException.getUserAction().getActionIntent();
+                    this.cordova.setActivityResultCallback(this);
+                    this.pendingDeleteMediaUri = uri;
+                    try {
+                        this.cordova.getActivity().startIntentSenderForResult(
+                            pendingIntent.getIntentSender(),
+                            RECOVERABLE_DELETE_REQUEST, null, 0, 0,
+                            0, null
+                        );
+                    } catch (IntentSender.SendIntentException e) {
+                        e.printStackTrace();
+                    }
+                } else {
+                    throw new RuntimeException(securityException.getMessage(), securityException);
+                }
+            }
             cursor.close();
         }
     }
@@ -1390,5 +1458,14 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
         }
 
         this.callbackContext = callbackContext;
+    }
+
+    private boolean hasPermissions(String[] permissions) {
+        for (String permission: permissions) {
+            if (!PermissionHelper.hasPermission(this, permission)) {
+                return false;
+            }
+        }
+        return true;
     }
 }
